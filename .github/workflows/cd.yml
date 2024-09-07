@@ -1,4 +1,6 @@
-name: deploy
+name: Make release
+permissions:
+  contents: write
 
 on:
   push:
