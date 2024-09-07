@@ -1,0 +1,44 @@
+name: deploy
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            os_suffix: linux
+            extension: ""
+            name: "slack-mattermost-splitter"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        default: true
+    - name: Build
+      uses: actions-rs/cargo@v1.0.1
+      with:
+        command: build
+        args: --release
+    - name: Generate hashes
+      shell: bash
+      run: |
+        cp target/release/${{ matrix.name }} target/release/${{ matrix.name }}-${{ matrix.os_suffix }}
+        sha256sum target/release/${{ matrix.name }} > ${{ matrix.name }}-${{ matrix.os_suffix }}.sha256
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          target/release/${{ matrix.name }}-${{ matrix.os_suffix }}
+          ${{ matrix.name }}-${{ matrix.os_suffix }}.sha256
+          script.sh
