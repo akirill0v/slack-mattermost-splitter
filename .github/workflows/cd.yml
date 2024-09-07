@@ -36,7 +36,7 @@ jobs:
         cp target/release/${{ matrix.name }} target/release/${{ matrix.name }}-${{ matrix.os_suffix }}
         sha256sum target/release/${{ matrix.name }} > ${{ matrix.name }}-${{ matrix.os_suffix }}.sha256
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           target/release/${{ matrix.name }}-${{ matrix.os_suffix }}
