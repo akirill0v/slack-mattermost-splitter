@@ -6,6 +6,7 @@ use async_zip::{
     Compression, ZipEntryBuilder, ZipString,
 };
 use futures::{AsyncReadExt, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use tokio::{
     fs::File,
@@ -36,11 +37,14 @@ pub struct Splitter {
     shared_files_idx: HashMap<String, usize>,
     // List of chunks with file path:idx mapping
     chunked_files_idx: Vec<HashMap<String, usize>>,
+
+    pb: ProgressBar,
 }
 
 impl Splitter {
     pub async fn new(config: Config) -> Result<Self> {
         info!("Open zip file...");
+        let pb = ProgressBar::new_spinner();
         let reader = ZipFileReader::with_tokio(BufReader::new(
             File::open(config.slack_archive.clone()).await?,
         ))
@@ -48,6 +52,7 @@ impl Splitter {
         Ok(Splitter {
             reader,
             config,
+            pb,
             shared_files_idx: HashMap::new(),
             chunked_files_idx: Vec::new(),
         })
@@ -172,7 +177,15 @@ impl Splitter {
         downloads: &mut Vec<Download>,
     ) -> Result<()> {
         let all_files = downloads.len();
-        for (idx, zip_path) in downloads.into_iter().enumerate() {
+        self.pb = ProgressBar::new(all_files as u64);
+        self.pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
+                )
+                .unwrap(),
+            );
+
+        for zip_path in downloads.iter() {
             let filename = zip_path.filename.clone();
             let full_name = self.config.output.join(filename.clone());
 
@@ -184,7 +197,8 @@ impl Splitter {
                 .map(FuturesAsyncWriteCompatExt::compat_write)
             {
                 Ok(mut writer) => {
-                    info!("Archive {} of {} files...", idx, all_files);
+                    // info!("Archive {} of {} files...", idx, all_files);
+                    self.pb.inc(1);
                     match File::open(full_name.clone()).await {
                         Ok(mut file) => {
                             let mut reader = ReaderStream::with_capacity(&mut file, BUF_SIZE);
