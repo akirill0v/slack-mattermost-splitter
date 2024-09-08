@@ -80,10 +80,19 @@ impl Splitter {
 
         info!("Split {total_entries} files to chunks by {chunk_size} items maximum...");
 
+        self.pb = ProgressBar::new(total_entries as u64);
+        self.pb.set_style(
+                ProgressStyle::with_template(
+                    "Scan files: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
+                )
+                .unwrap(),
+            );
+
         for (chunk_idx, chunk) in self.reader.file().entries().chunks(chunk_size).enumerate() {
             let mut chunk_map: HashMap<String, usize> = HashMap::new();
             for (entry_idx, entry) in chunk.iter().enumerate() {
                 let index = chunk_size * chunk_idx + entry_idx;
+                self.pb.inc(1);
                 if let Ok(filename) = entry.filename().clone().into_string() {
                     if filename.ends_with(".json") && !SHARED_NAMES.contains(&filename.as_ref()) {
                         chunk_map.insert(filename, index);
@@ -123,6 +132,7 @@ impl Splitter {
                 .join(format!("chunk_{:03}_{}", idx, archive_name));
 
             info!("Output: {:?}", output);
+
             self.export_chunk(output, chunk).await?;
         }
         Ok(())
@@ -134,6 +144,14 @@ impl Splitter {
         let mut writer = ZipFileWriter::with_tokio(&mut out_file);
         let mut downloads: Vec<Download> = Vec::new();
 
+        self.pb = ProgressBar::new(chunk.len() as u64);
+        self.pb.set_style(
+              ProgressStyle::with_template(
+                  "Export chunks: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
+              )
+              .unwrap(),
+          );
+
         // Copy all shared files
         for (filename, idx) in self.shared_files_idx.clone().into_iter() {
             self.parse_and_copy_file(idx, filename, &mut writer, &mut downloads)
@@ -142,6 +160,7 @@ impl Splitter {
 
         // Copy other files
         for (filename, idx) in chunk.into_iter() {
+            self.pb.inc(1);
             self.parse_and_copy_file(idx, filename, &mut writer, &mut downloads)
                 .await?;
         }
@@ -303,7 +322,7 @@ impl Splitter {
                 Ok(url) => {
                     downloads.push(Download { url, filename });
                 }
-                Err(e) => error!("Parse url error: {e}"),
+                Err(e) => error!("Parse url {} error: {e}", &file.url_for_download()),
             }
         }
         Ok(())
