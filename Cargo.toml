@@ -6,7 +6,12 @@ edition = "2021"
 [dependencies]
 
 anyhow = "*"
-async_zip = { version = "0.0.17", features = ["full"] }
+async_zip = { version = "0.0.17", features = [
+  "async-compression",
+  "full",
+  "tokio",
+  "tokio-util",
+] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 json_value_merge = "2.0"
@@ -39,9 +44,9 @@ rmp-serde = "1.3.0"
 futures-util = "0.3.30"
 reqwest-retry = "0.6.1"
 
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+# [profile.release]
+# opt-level = 3
+# lto = true
+# codegen-units = 1
+# panic = "abort"
+# strip = true

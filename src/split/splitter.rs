@@ -1,18 +1,25 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, ffi::OsStr, path::PathBuf};
 
 use anyhow::Result;
 use async_zip::{
     base::{read::seek::ZipFileReader, write::ZipFileWriter},
     Compression, ZipEntryBuilder, ZipString,
 };
-use futures::AsyncReadExt;
-use log::info;
-use tokio::{fs::File, io::BufReader};
-use tokio_util::compat::Compat;
-
-use crate::downloader::chunked::{Download, DownloaderClient};
+use futures::{AsyncReadExt, StreamExt};
+use log::{error, info, warn};
+use tokio::{
+    fs::File,
+    io::{self, AsyncWrite, AsyncWriteExt, BufReader},
+};
+use tokio_util::{
+    compat::{Compat, FuturesAsyncWriteCompatExt, TokioAsyncWriteCompatExt},
+    io::ReaderStream,
+};
+use trauma::{download::Download, downloader::DownloaderBuilder};
 
 use super::{model, Config};
+
+const BUF_SIZE: usize = 65536;
 
 static SHARED_NAMES: &[&str] = &[
     "users.json",
@@ -60,7 +67,7 @@ impl Splitter {
         // Calculate chunk size
         let total_entries = self.reader.file().entries().len();
 
-        let chunk_size = if self.config.num_chunks > 0 {
+        let chunk_size = if self.config.num_chunks > 1 {
             total_entries / self.config.num_chunks
         } else {
             self.config.chunk_size
@@ -96,26 +103,27 @@ impl Splitter {
                 self.chunked_files_idx.len(),
                 chunk.len(),
             );
+            let archive_name = self
+                .config
+                .slack_archive
+                .file_name()
+                .unwrap_or(OsStr::new("output.zip"))
+                .to_str()
+                .unwrap_or("output.zip")
+                .to_string();
 
-            let output = self.config.output_archive.clone();
-            let output_dir = output
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("/tmp"));
-            let output_filename = output.file_name().unwrap().to_str().unwrap();
-            let output = output_dir.join(format!("chunk_{:03}_{}", idx, output_filename));
+            let output = self
+                .config
+                .output
+                .join(format!("chunk_{:03}_{}", idx, archive_name));
 
             info!("Output: {:?}", output);
-            self.export_chunk(output, idx, chunk).await?;
+            self.export_chunk(output, chunk).await?;
         }
         Ok(())
     }
 
-    async fn export_chunk(
-        &mut self,
-        path: PathBuf,
-        c_idx: usize,
-        chunk: HashMap<String, usize>,
-    ) -> Result<()> {
+    async fn export_chunk(&mut self, path: PathBuf, chunk: HashMap<String, usize>) -> Result<()> {
         // Create out file
         let mut out_file = File::create(path).await?;
         let mut writer = ZipFileWriter::with_tokio(&mut out_file);
@@ -133,30 +141,103 @@ impl Splitter {
                 .await?;
         }
 
-        let all_files_for_download = downloads.len();
-
         info!("Start downloading {} files", downloads.len());
-        for (chunk_idx, chunk_downloads) in downloads.chunks(self.config.concurrent).enumerate() {
-            let mut client = DownloaderClient::new(chunk_downloads);
-            let downloaded_files = client.download_many().await?;
 
-            for (idx, d) in downloaded_files.iter().enumerate() {
-                let builder =
-                    ZipEntryBuilder::new(ZipString::from(d.out.clone()), Compression::Deflate);
-                info!(
-                    "Write (Chunk:{}, {} of {}) file {}",
-                    c_idx + 1,
-                    chunk_idx * self.config.concurrent + idx,
-                    all_files_for_download,
-                    d.out
-                );
-                writer.write_entry_whole(builder, d.data.as_slice()).await?;
-            }
-        }
+        let downloader = DownloaderBuilder::new()
+            .concurrent_downloads(self.config.concurrent)
+            .directory(self.config.output.clone())
+            .build();
+        let _summaries = downloader.download(&downloads).await;
 
         info!("Downloaded complete!..");
 
+        // ADD Downloaded files to archive
+
+        if !downloads.is_empty() {
+            info!("Write upload files to zip archive...");
+            self.zip_downloaded_files(&mut writer, &mut downloads)
+                .await?;
+        }
+
         writer.close().await?;
+
+        info!("Done...");
+
+        Ok(())
+    }
+
+    async fn zip_downloaded_files(
+        &mut self,
+        writer: &mut ZipFileWriter<Compat<&mut File>>,
+        downloads: &mut Vec<Download>,
+    ) -> Result<()> {
+        let all_files = downloads.len();
+        for (idx, zip_path) in downloads.into_iter().enumerate() {
+            let filename = zip_path.filename.clone();
+            let full_name = self.config.output.join(filename.clone());
+
+            let builder = ZipEntryBuilder::new(ZipString::from(filename), Compression::Deflate);
+            // Read stream and write to writer...
+            match writer
+                .write_entry_stream(builder)
+                .await
+                .map(FuturesAsyncWriteCompatExt::compat_write)
+            {
+                Ok(mut writer) => {
+                    info!("Archive {} of {} files...", idx, all_files);
+                    match File::open(full_name.clone()).await {
+                        Ok(mut file) => {
+                            let mut reader = ReaderStream::with_capacity(&mut file, BUF_SIZE);
+                            while let Some(chunk) = reader.next().await {
+                                writer.write_all(&chunk?).await?;
+                            }
+
+                            writer.into_inner().close().await?;
+
+                            if let Err(e) = tokio::fs::remove_file(full_name.clone()).await {
+                                warn!("Failed to remove temp file {:?}: {}", full_name, e)
+                            }
+                        }
+                        Err(e) => {
+                            error!("Cannot open file... {:?}", full_name.to_str());
+                            error!("Error {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => error!(
+                    "Error writing file {} to archive: {}",
+                    zip_path.filename, err
+                ),
+            }
+        }
+
+        // Remove temp dir if esists
+        let artefacts_dir = self.config.output.join("__uploads");
+
+        tokio::fs::metadata(artefacts_dir.clone())
+            .await
+            .map(|metadata| (metadata, artefacts_dir.clone()))
+            .map(|(metadata, dir)| async move {
+                if metadata.is_dir() {
+                    match tokio::fs::remove_dir_all(&dir).await {
+                        Ok(_) => info!("Removed temp uploads directory: {:?}", self.config.output),
+                        Err(e) => warn!(
+                            "Failed to remove temp uploads directory {:?}: {}",
+                            self.config.output, e
+                        ),
+                    }
+                }
+            })?
+            .await;
+
+        if tokio::fs::metadata(&artefacts_dir).await.is_ok() {
+            info!("Removing temp uploads directory: {:?}", artefacts_dir);
+        } else {
+            warn!("Temp uploads directory not found: {:?}", artefacts_dir);
+            return Ok(());
+        }
+
         Ok(())
     }
 
@@ -203,12 +284,13 @@ impl Splitter {
         for file in files.iter() {
             let filename = format!("__uploads/{}/{}", file.id, file.name);
             // Download
-            let download = Download {
-                url: file.url_for_download(),
-                out: filename,
-                data: Vec::new(),
-            };
-            downloads.push(download);
+            let url = reqwest::Url::parse(&file.url_for_download());
+            match url {
+                Ok(url) => {
+                    downloads.push(Download { url, filename });
+                }
+                Err(e) => error!("Parse url error: {e}"),
+            }
         }
         Ok(())
     }

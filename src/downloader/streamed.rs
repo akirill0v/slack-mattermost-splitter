@@ -1,19 +1,13 @@
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use futures_util::future::join_all;
 use futures_util::StreamExt;
-use log::info;
 use reqwest::Response;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use tokio::io::AsyncWrite;
-use tokio::{fs::File, io::BufReader};
+use tokio::fs::File;
 
-use async_zip::{
-    tokio::{read::seek::ZipFileReader, write::ZipFileWriter},
-    Compression, ZipEntryBuilder, ZipString,
-};
 
 const BUF_SIZE: usize = 65536;
 

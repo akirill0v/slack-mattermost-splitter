@@ -11,13 +11,10 @@ struct Args {
     #[command(subcommand)]
     cmd: Commands,
 
-    #[arg(short, long, default_value_t = 1)]
-    concurrency: usize,
-
     #[arg(long, default_value_t = 100)]
     chunk_size: usize,
 
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 1)]
     num_chunks: usize,
 
     #[arg(long, default_value_t = 5)]
@@ -44,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Transform { input, output } => {
             let config = split::Config {
                 slack_archive: PathBuf::from(input),
-                output_archive: PathBuf::from(output),
+                output: PathBuf::from(output),
                 chunk_size: args.chunk_size,
                 num_chunks: args.num_chunks,
                 concurrent: args.concurrent,
