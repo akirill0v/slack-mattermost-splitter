@@ -37,6 +37,7 @@ pub struct Splitter {
     shared_files_idx: HashMap<String, usize>,
     // List of chunks with file path:idx mapping
     chunked_files_idx: Vec<HashMap<String, usize>>,
+    files_idx: HashMap<String, usize>,
 
     pb: ProgressBar,
 }
@@ -55,12 +56,14 @@ impl Splitter {
             pb,
             shared_files_idx: HashMap::new(),
             chunked_files_idx: Vec::new(),
+            files_idx: HashMap::new(),
         })
     }
 
     pub async fn split(&mut self) -> Result<()> {
         info!("Sptit..");
         self.scan_files().await?;
+        self.split_files_to_chunks();
         self.export_chunks().await?;
         Ok(())
     }
@@ -69,18 +72,9 @@ impl Splitter {
         info!("Scan zip file structure and split to chunks...");
         dbg!(&self.config);
 
-        // Calculate chunk size
-        let total_entries = self.reader.file().entries().len();
+        let all_entries = self.reader.file().entries();
 
-        let chunk_size = if self.config.num_chunks > 1 {
-            total_entries / self.config.num_chunks
-        } else {
-            self.config.chunk_size
-        };
-
-        info!("Split {total_entries} files to chunks by {chunk_size} items maximum...");
-
-        self.pb = ProgressBar::new(total_entries as u64);
+        self.pb = ProgressBar::new(all_entries.len() as u64);
         self.pb.set_style(
                 ProgressStyle::with_template(
                     "Scan files: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
@@ -88,25 +82,41 @@ impl Splitter {
                 .unwrap(),
             );
 
-        for (chunk_idx, chunk) in self.reader.file().entries().chunks(chunk_size).enumerate() {
-            let mut chunk_map: HashMap<String, usize> = HashMap::new();
-            for (entry_idx, entry) in chunk.iter().enumerate() {
-                let index = chunk_size * chunk_idx + entry_idx;
-                self.pb.inc(1);
-                if let Ok(filename) = entry.filename().clone().into_string() {
-                    if filename.ends_with(".json") && !SHARED_NAMES.contains(&filename.as_ref()) {
-                        chunk_map.insert(filename, index);
-                    } else if filename.ends_with(".json") {
-                        self.shared_files_idx.insert(filename, index);
-                    }
+        for (idx, entry) in all_entries.iter().enumerate() {
+            self.pb.inc(1);
+            if let Ok(filename) = entry.filename().clone().into_string() {
+                if filename.ends_with(".json") && !SHARED_NAMES.contains(&filename.as_ref()) {
+                    self.files_idx.insert(filename, idx);
+                } else if filename.ends_with(".json") {
+                    self.shared_files_idx.insert(filename, idx);
                 }
+            }
+        }
+        self.pb.finish();
+        info!("Scanned: {} files", all_entries.len());
+        Ok(())
+    }
+
+    fn split_files_to_chunks(&mut self) {
+        let mut sorted_files: Vec<_> = self.files_idx.iter().collect();
+        sorted_files.sort_by(|a, b| {
+            let a_binding = PathBuf::from(a.0);
+            let a_f = a_binding.file_name();
+            let b_binding = PathBuf::from(b.0);
+            let b_f = b_binding.file_name();
+            a_f.cmp(&b_f)
+        });
+
+        let chunk_size =
+            (sorted_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
+
+        for chunk in sorted_files.chunks(chunk_size) {
+            let mut chunk_map = HashMap::new();
+            for (filename, &idx) in chunk {
+                chunk_map.insert(filename.to_string(), idx);
             }
             self.chunked_files_idx.push(chunk_map);
         }
-
-        info!("... Splitted to {} chunks", self.chunked_files_idx.len());
-
-        Ok(())
     }
 
     pub async fn export_chunks(&mut self) -> Result<()> {
@@ -135,6 +145,7 @@ impl Splitter {
 
             self.export_chunk(output, chunk).await?;
         }
+
         Ok(())
     }
 
@@ -165,6 +176,7 @@ impl Splitter {
                 .await?;
         }
 
+        self.pb.finish();
         info!("Start downloading {} files", downloads.len());
 
         let downloader = DownloaderBuilder::new()
@@ -314,7 +326,7 @@ impl Splitter {
         files: &[model::File],
         downloads: &mut Vec<Download>,
     ) -> Result<()> {
-        for file in files.iter() {
+        for file in files.iter().filter(|f| !f.is_external) {
             let filename = format!("__uploads/{}/{}", file.id, file.name);
             // Download
             let url = reqwest::Url::parse(&file.url_for_download());
@@ -322,7 +334,9 @@ impl Splitter {
                 Ok(url) => {
                     downloads.push(Download { url, filename });
                 }
-                Err(e) => error!("Parse url {} error: {e}", &file.url_for_download()),
+                Err(e) => {
+                    error!("Parse url {} error: {e}", &file.url_for_download())
+                }
             }
         }
         Ok(())
