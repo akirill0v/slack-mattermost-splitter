@@ -10,10 +10,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use tokio::{
     fs::File,
-    io::{self, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
 };
 use tokio_util::{
-    compat::{Compat, FuturesAsyncWriteCompatExt, TokioAsyncWriteCompatExt},
+    compat::{Compat, FuturesAsyncWriteCompatExt},
     io::ReaderStream,
 };
 use trauma::{download::Download, downloader::DownloaderBuilder};
