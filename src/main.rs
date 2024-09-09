@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-mod downloader;
 mod split;
 
 #[derive(Parser, Debug)]
