@@ -36,12 +36,6 @@ impl File {
     pub fn url_for_download(&self) -> String {
         vec![self.url_private_download.clone(), self.url_private.clone()]
             .into_iter()
-            .map(|u| {
-                if u.is_empty() {
-                    dbg!(self.clone());
-                }
-                u
-            })
             .find(|u| !u.is_empty())
             .unwrap_or_default()
     }
