@@ -207,59 +207,71 @@ impl Splitter {
         writer: &mut ZipFileWriter<Compat<&mut File>>,
         downloads: &mut Vec<Download>,
     ) -> Result<()> {
-        let all_files = downloads.len();
-        self.pb = ProgressBar::new(all_files as u64);
+        let artefacts_dir = self.config.output.join("__uploads");
+        info!("Read files from {:?}", artefacts_dir);
+
+        let mut files_to_zip = Vec::new();
+        let mut stack = vec![artefacts_dir.clone()];
+
+        // Recursively traverse the directory structure
+        while let Some(dir) = stack.pop() {
+            let mut read_dir = tokio::fs::read_dir(dir).await?;
+            while let Some(entry) = read_dir.next_entry().await? {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file() {
+                    let filename = path
+                        .strip_prefix(&self.config.output)?
+                        .to_string_lossy()
+                        .into_owned();
+                    files_to_zip.push((path, filename));
+                }
+            }
+        }
+
+        self.pb = ProgressBar::new(files_to_zip.len() as u64);
         self.pb.set_style(
                 ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
+                    "Add to zip: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
                 )
                 .unwrap(),
             );
 
-        for zip_path in downloads.iter() {
-            let filename = zip_path.filename.clone();
-            let full_name = self.config.output.join(filename.clone());
-
-            let builder = ZipEntryBuilder::new(ZipString::from(filename), Compression::Deflate);
-            // Read stream and write to writer...
+        // Add files to archive
+        for (path, filename) in files_to_zip.iter() {
+            let builder =
+                ZipEntryBuilder::new(ZipString::from(filename.as_str()), Compression::Deflate);
             match writer
                 .write_entry_stream(builder)
                 .await
                 .map(FuturesAsyncWriteCompatExt::compat_write)
             {
-                Ok(mut writer) => {
-                    // info!("Archive {} of {} files...", idx, all_files);
+                Ok(mut zip_writer) => {
                     self.pb.inc(1);
-                    match File::open(full_name.clone()).await {
+                    match File::open(path.clone()).await {
                         Ok(mut file) => {
                             let mut reader = ReaderStream::with_capacity(&mut file, BUF_SIZE);
                             while let Some(chunk) = reader.next().await {
-                                writer.write_all(&chunk?).await?;
+                                zip_writer.write_all(&chunk?).await?;
                             }
-
-                            writer.into_inner().close().await?;
-
-                            if let Err(e) = tokio::fs::remove_file(full_name.clone()).await {
-                                warn!("Failed to remove temp file {:?}: {}", full_name, e)
+                            zip_writer.into_inner().close().await?;
+                            if let Err(e) = tokio::fs::remove_file(path.clone()).await {
+                                warn!("Failed to remove temp file {:?}: {}", path, e);
                             }
                         }
                         Err(e) => {
-                            error!("Cannot open file... {:?}", full_name.to_str());
+                            error!("Cannot open file... {:?}", path.to_str());
                             error!("Error {}", e);
                             continue;
                         }
                     }
                 }
-                Err(err) => error!(
-                    "Error writing file {} to archive: {}",
-                    zip_path.filename, err
-                ),
+                Err(err) => error!("Error writing file {} to archive: {}", filename, err),
             }
         }
 
-        // Remove temp dir if esists
-        let artefacts_dir = self.config.output.join("__uploads");
-
+        // Cleanup __uploads directory
         tokio::fs::metadata(artefacts_dir.clone())
             .await
             .map(|metadata| (metadata, artefacts_dir.clone()))
@@ -275,13 +287,6 @@ impl Splitter {
                 }
             })?
             .await;
-
-        if tokio::fs::metadata(&artefacts_dir).await.is_ok() {
-            info!("Removing temp uploads directory: {:?}", artefacts_dir);
-        } else {
-            warn!("Temp uploads directory not found: {:?}", artefacts_dir);
-            return Ok(());
-        }
 
         Ok(())
     }
