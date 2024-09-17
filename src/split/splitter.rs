@@ -37,7 +37,9 @@ pub struct Splitter {
     shared_files_idx: HashMap<String, usize>,
     // List of chunks with file path:idx mapping
     chunked_files_idx: Vec<HashMap<String, usize>>,
-    files_idx: HashMap<String, usize>,
+    // files_idx: HashMap<String, usize>,
+    // HashMap with channel keys, contains (filename, index_in_arch)
+    grouped_files_idx: HashMap<String, Vec<(String, usize)>>,
 
     pb: ProgressBar,
 }
@@ -56,7 +58,8 @@ impl Splitter {
             pb,
             shared_files_idx: HashMap::new(),
             chunked_files_idx: Vec::new(),
-            files_idx: HashMap::new(),
+            // files_idx: HashMap::new(),
+            grouped_files_idx: HashMap::new(),
         })
     }
 
@@ -86,7 +89,15 @@ impl Splitter {
             self.pb.inc(1);
             if let Ok(filename) = entry.filename().clone().into_string() {
                 if filename.ends_with(".json") && !SHARED_NAMES.contains(&filename.as_ref()) {
-                    self.files_idx.insert(filename, idx);
+                    let dirname = filename.split('/').next().unwrap_or("-");
+
+                    let entry = self
+                        .grouped_files_idx
+                        .entry(dirname.to_string())
+                        .or_default();
+
+                    entry.push((filename, idx));
+                    // self.files_idx.insert(filename, idx);
                 } else if filename.ends_with(".json") {
                     self.shared_files_idx.insert(filename, idx);
                 }
@@ -94,26 +105,26 @@ impl Splitter {
         }
         self.pb.finish();
         info!("Scanned: {} files", all_entries.len());
+        info!(
+            "Fetch {} groups and direct channels",
+            self.grouped_files_idx.len()
+        );
         Ok(())
     }
 
+    // Split all files to chunks by full channels
     fn split_files_to_chunks(&mut self) {
-        let mut sorted_files: Vec<_> = self.files_idx.iter().collect();
-        sorted_files.sort_by(|a, b| {
-            let a_binding = PathBuf::from(a.0);
-            let a_f = a_binding.file_name();
-            let b_binding = PathBuf::from(b.0);
-            let b_f = b_binding.file_name();
-            a_f.cmp(&b_f)
-        });
+        let grouped_files: Vec<_> = self.grouped_files_idx.iter().collect();
 
         let chunk_size =
-            (sorted_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
+            (grouped_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
 
-        for chunk in sorted_files.chunks(chunk_size) {
+        for chunk in grouped_files.chunks(chunk_size) {
             let mut chunk_map = HashMap::new();
-            for (filename, &idx) in chunk {
-                chunk_map.insert(filename.to_string(), idx);
+            for (_, files) in chunk {
+                for (filename, idx) in files.iter() {
+                    chunk_map.insert(filename.to_string(), idx.to_owned());
+                }
             }
             self.chunked_files_idx.push(chunk_map);
         }
