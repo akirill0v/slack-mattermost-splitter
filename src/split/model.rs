@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct Direct {
+    pub id: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct SlackPost {
     #[serde(flatten)]
     pub extra: serde_json::Value,

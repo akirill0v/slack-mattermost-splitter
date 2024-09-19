@@ -18,6 +18,15 @@ struct Args {
 
     #[arg(long, default_value_t = 5)]
     concurrent: usize,
+
+    #[arg(long, default_value_t = false)]
+    skip_downloading: bool,
+
+    #[arg(long, default_value_t = false)]
+    skip_directs: bool,
+
+    #[arg(long, default_value_t = false)]
+    skip_channels: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -44,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
                 chunk_size: args.chunk_size,
                 num_chunks: args.num_chunks,
                 concurrent: args.concurrent,
+                skip_directs: args.skip_directs,
+                skip_channels: args.skip_channels,
+                skip_downloading: args.skip_downloading,
             };
             let mut splitter = split::Splitter::new(config).await?;
             splitter.split().await?;

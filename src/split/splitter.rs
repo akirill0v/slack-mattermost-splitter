@@ -1,6 +1,6 @@
 use std::{collections::HashMap, ffi::OsStr, path::PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use async_zip::{
     base::{read::seek::ZipFileReader, write::ZipFileWriter},
     Compression, ZipEntryBuilder, ZipString,
@@ -41,6 +41,9 @@ pub struct Splitter {
     // HashMap with channel keys, contains (filename, index_in_arch)
     grouped_files_idx: HashMap<String, Vec<(String, usize)>>,
 
+    // HashMap with direct_channel keys, contains (filename, index_in_arch)
+    direct_files_idx: HashMap<String, Vec<(String, usize)>>,
+
     pb: ProgressBar,
 }
 
@@ -60,14 +63,63 @@ impl Splitter {
             chunked_files_idx: Vec::new(),
             // files_idx: HashMap::new(),
             grouped_files_idx: HashMap::new(),
+            direct_files_idx: HashMap::new(),
         })
     }
 
     pub async fn split(&mut self) -> Result<()> {
         info!("Sptit..");
         self.scan_files().await?;
-        self.split_files_to_chunks();
-        self.export_chunks().await?;
+        if !self.config.skip_directs {
+            self.fetch_directs().await?;
+            self.export_directs().await?;
+        }
+        if !self.config.skip_channels {
+            self.split_files_to_chunks();
+            self.export_chunks().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_directs(&mut self) -> Result<()> {
+        let dms_file_idx = match self.shared_files_idx.get("dms.json") {
+            Some(idx) => *idx,
+            None => {
+                bail!("dms.json not found in shared files");
+            }
+        };
+
+        let mut reader = self.reader.reader_with_entry(dms_file_idx).await?;
+        let mut buffer: Vec<u8> = Vec::new();
+        reader.read_to_end(&mut buffer).await?;
+
+        let dms: Vec<model::Direct> = match serde_json::from_slice(&buffer) {
+            Ok(dms) => dms,
+            Err(e) => {
+                bail!("Failed to deserialize dms.json: {}", e);
+            }
+        };
+
+        info!(
+            "Successfully deserialized dms.json with {} entries",
+            dms.len()
+        );
+
+        for dm in dms {
+            if let Some((dir, files)) = self.grouped_files_idx.get_key_value(&dm.id) {
+                self.direct_files_idx.insert(dir.clone(), files.clone());
+            } else {
+                error!("Cannot find direct {} in grouped files", &dm.id);
+            }
+
+            self.grouped_files_idx.remove(&dm.id);
+        }
+
+        info!(
+            "Successfully copied directs: {}...",
+            self.direct_files_idx.len()
+        );
+
         Ok(())
     }
 
@@ -130,6 +182,30 @@ impl Splitter {
         }
     }
 
+    pub async fn export_directs(&mut self) -> Result<()> {
+        let archive_name = self
+            .config
+            .slack_archive
+            .file_name()
+            .unwrap_or(OsStr::new("output.zip"))
+            .to_str()
+            .unwrap_or("output.zip")
+            .to_string();
+
+        let output = self.config.output.join(format!("direct_{}", archive_name));
+
+        info!("Output: {:?}", output);
+
+        let mut chunk = HashMap::new();
+        for (_, files) in self.direct_files_idx.clone().into_iter() {
+            for (filename, idx) in files.into_iter() {
+                chunk.insert(filename, idx);
+            }
+        }
+
+        self.export_chunk(output, chunk).await
+    }
+
     pub async fn export_chunks(&mut self) -> Result<()> {
         for (idx, chunk) in self.chunked_files_idx.clone().into_iter().enumerate() {
             info!(
@@ -188,22 +264,26 @@ impl Splitter {
         }
 
         self.pb.finish();
-        info!("Start downloading {} files", downloads.len());
 
-        let downloader = DownloaderBuilder::new()
-            .concurrent_downloads(self.config.concurrent)
-            .directory(self.config.output.clone())
-            .build();
-        let _summaries = downloader.download(&downloads).await;
+        if self.config.skip_downloading {
+            warn!("Skip downloading artefacts!!!");
+        } else {
+            info!("Start downloading {} files", downloads.len());
+            let downloader = DownloaderBuilder::new()
+                .concurrent_downloads(self.config.concurrent)
+                .directory(self.config.output.clone())
+                .build();
+            let _summaries = downloader.download(&downloads).await;
 
-        info!("Downloaded complete!..");
+            info!("Downloaded complete!..");
 
-        // ADD Downloaded files to archive
+            // ADD Downloaded files to archive
 
-        if !downloads.is_empty() {
-            info!("Write upload files to zip archive...");
-            self.zip_downloaded_files(&mut writer, &mut downloads)
-                .await?;
+            if !downloads.is_empty() {
+                info!("Write upload files to zip archive...");
+                self.zip_downloaded_files(&mut writer, &mut downloads)
+                    .await?;
+            }
         }
 
         writer.close().await?;
@@ -342,7 +422,10 @@ impl Splitter {
         files: &[model::File],
         downloads: &mut Vec<Download>,
     ) -> Result<()> {
-        for file in files.iter().filter(|f| !f.is_external) {
+        for file in files
+            .iter()
+            .filter(|f| !f.is_external && !f.url_for_download().is_empty())
+        {
             let filename = format!("__uploads/{}/{}", file.id, file.name);
             // Download
             let url = reqwest::Url::parse(&file.url_for_download());
