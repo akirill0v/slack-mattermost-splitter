@@ -227,7 +227,9 @@ impl Splitter {
 
             info!("Output: {:?}", output);
 
-            self.export_chunk(output, chunk).await?;
+            let shared_files = vec!["users.json", "dms.json"];
+
+            self.export_chunk(output, chunk, shared_files).await?;
         }
 
         Ok(())
@@ -257,13 +259,20 @@ impl Splitter {
 
             info!("Output: {:?}", output);
 
-            self.export_chunk(output, chunk).await?;
+            let shared_files = vec!["users.json", "channels.json", "groups.json", "mpims.json"];
+
+            self.export_chunk(output, chunk, shared_files).await?;
         }
 
         Ok(())
     }
 
-    async fn export_chunk(&mut self, path: PathBuf, chunk: HashMap<String, usize>) -> Result<()> {
+    async fn export_chunk(
+        &mut self,
+        path: PathBuf,
+        chunk: HashMap<String, usize>,
+        shared_files: Vec<&str>,
+    ) -> Result<()> {
         // Create out file
         let mut out_file = File::create(path).await?;
         let mut writer = ZipFileWriter::with_tokio(&mut out_file);
@@ -278,7 +287,12 @@ impl Splitter {
           );
 
         // Copy all shared files
-        for (filename, idx) in self.shared_files_idx.clone().into_iter() {
+        for (filename, idx) in self
+            .shared_files_idx
+            .clone()
+            .into_iter()
+            .filter(|f| shared_files.contains(&f.0.as_str()))
+        {
             self.parse_and_copy_file(idx, filename, &mut writer, &mut downloads)
                 .await?;
         }
