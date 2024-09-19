@@ -1,11 +1,11 @@
 use std::{collections::HashMap, ffi::OsStr, path::PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Error, Result};
 use async_zip::{
     base::{read::seek::ZipFileReader, write::ZipFileWriter},
     Compression, ZipEntryBuilder, ZipString,
 };
-use futures::{AsyncReadExt, StreamExt};
+use futures::{AsyncReadExt, SinkExt, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use tokio::{
@@ -18,7 +18,10 @@ use tokio_util::{
 };
 use trauma::{download::Download, downloader::DownloaderBuilder};
 
-use super::{model, Config};
+use super::{
+    model::{self, Chunk, ChunkItem, Direct},
+    Config,
+};
 
 const BUF_SIZE: usize = 65536;
 
@@ -36,14 +39,15 @@ pub struct Splitter {
 
     shared_files_idx: HashMap<String, usize>,
     // List of chunks with file path:idx mapping
-    chunked_files_idx: Vec<HashMap<String, usize>>,
+    chunked_files_idx: Vec<Chunk>,
     // files_idx: HashMap<String, usize>,
     // HashMap with channel keys, contains (filename, index_in_arch)
     grouped_files_idx: HashMap<String, Vec<(String, usize)>>,
 
+    directs: Vec<Direct>,
     // HashMap with direct_channel keys, contains (filename, index_in_arch)
     direct_files_idx: HashMap<String, Vec<(String, usize)>>,
-    chunked_directs_idx: Vec<HashMap<String, usize>>,
+    chunked_directs_idx: Vec<Chunk>,
 
     pb: ProgressBar,
 }
@@ -63,6 +67,7 @@ impl Splitter {
             shared_files_idx: HashMap::new(),
             chunked_files_idx: Vec::new(),
             // files_idx: HashMap::new(),
+            directs: Vec::new(),
             grouped_files_idx: HashMap::new(),
             direct_files_idx: HashMap::new(),
             chunked_directs_idx: Vec::new(),
@@ -96,7 +101,7 @@ impl Splitter {
         let mut buffer: Vec<u8> = Vec::new();
         reader.read_to_end(&mut buffer).await?;
 
-        let dms: Vec<model::Direct> = match serde_json::from_slice(&buffer) {
+        self.directs = match serde_json::from_slice(&buffer) {
             Ok(dms) => dms,
             Err(e) => {
                 bail!("Failed to deserialize dms.json: {}", e);
@@ -105,10 +110,10 @@ impl Splitter {
 
         info!(
             "Successfully deserialized dms.json with {} entries",
-            dms.len()
+            self.directs.len()
         );
 
-        for dm in dms {
+        for dm in self.directs.iter() {
             if let Some((dir, files)) = self.grouped_files_idx.get_key_value(&dm.id) {
                 self.direct_files_idx.insert(dir.clone(), files.clone());
             } else {
@@ -169,37 +174,57 @@ impl Splitter {
 
     // Split direct files to chunks by full channels
     fn split_directs_to_chunks(&mut self) {
-        let grouped_files: Vec<_> = self.direct_files_idx.iter().collect();
+        let keys: Vec<String> = self
+            .direct_files_idx
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
 
-        let chunk_size =
-            (grouped_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
+        let chunk_size = (keys.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
 
-        for chunk in grouped_files.chunks(chunk_size) {
-            let mut chunk_map = HashMap::new();
-            for (_, files) in chunk {
-                for (filename, idx) in files.iter() {
-                    chunk_map.insert(filename.to_string(), idx.to_owned());
+        for chunked_keys in keys.chunks(chunk_size) {
+            let mut chunk = Chunk::default();
+            for key in chunked_keys {
+                let mut chunk_item = ChunkItem {
+                    id: key.clone(),
+                    files: Vec::new(),
+                };
+                if let Some(files) = self.direct_files_idx.get(key) {
+                    for (filename, idx) in files {
+                        chunk_item.files.push((filename.to_string(), *idx));
+                    }
                 }
+                chunk.items.push(chunk_item);
             }
-            self.chunked_directs_idx.push(chunk_map);
+            self.chunked_directs_idx.push(chunk);
         }
     }
 
     // Split all files to chunks by full channels
     fn split_files_to_chunks(&mut self) {
-        let grouped_files: Vec<_> = self.grouped_files_idx.iter().collect();
+        let keys: Vec<String> = self
+            .grouped_files_idx
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
 
-        let chunk_size =
-            (grouped_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
+        let chunk_size = (keys.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
 
-        for chunk in grouped_files.chunks(chunk_size) {
-            let mut chunk_map = HashMap::new();
-            for (_, files) in chunk {
-                for (filename, idx) in files.iter() {
-                    chunk_map.insert(filename.to_string(), idx.to_owned());
+        for chunked_keys in keys.chunks(chunk_size) {
+            let mut chunk = Chunk::default();
+            for key in chunked_keys {
+                let mut chunk_item = ChunkItem {
+                    id: key.clone(),
+                    files: Vec::new(),
+                };
+                if let Some(files) = self.grouped_files_idx.get(key) {
+                    for (filename, idx) in files {
+                        chunk_item.files.push((filename.to_string(), *idx));
+                    }
                 }
+                chunk.items.push(chunk_item);
             }
-            self.chunked_files_idx.push(chunk_map);
+            self.chunked_files_idx.push(chunk);
         }
     }
 
@@ -215,10 +240,10 @@ impl Splitter {
 
         for (idx, chunk) in self.chunked_directs_idx.clone().into_iter().enumerate() {
             info!(
-                "Export {} of {} directs chunk, files: {}",
+                "Export {} of {} directs chunk: {}",
                 idx + 1,
                 self.chunked_directs_idx.len(),
-                chunk.len(),
+                chunk.items.len(),
             );
             let output = self
                 .config
@@ -227,9 +252,22 @@ impl Splitter {
 
             info!("Output: {:?}", output);
 
-            let shared_files = vec!["users.json", "dms.json"];
+            let shared_files = vec!["users.json"];
+            // Filter chunked directs and export them to dms.json
+            // let keys: Vec<String> = chunk.item.keys().clone().map(|c| c.to_string()).collect();
+            let keys: Vec<String> = chunk.items.iter().map(|ci| ci.id.clone()).collect();
+            let chunked_directs: Vec<&Direct> = self
+                .directs
+                .iter()
+                .filter(|d| keys.contains(&d.id))
+                .collect();
+            info!("Filtered data: {} directs in chunk", chunked_directs.len());
+            let data = serde_json::to_vec(&chunked_directs)?;
+            let mut additional_data = HashMap::new();
+            additional_data.insert(String::from("dms.json"), data.as_slice());
 
-            self.export_chunk(output, chunk, shared_files).await?;
+            self.export_chunk(output, chunk, shared_files, &additional_data)
+                .await?;
         }
 
         Ok(())
@@ -247,10 +285,10 @@ impl Splitter {
 
         for (idx, chunk) in self.chunked_files_idx.clone().into_iter().enumerate() {
             info!(
-                "Export {} of {} channels chunk, files: {}",
+                "Export {} of {} channels chunks: {}",
                 idx + 1,
                 self.chunked_files_idx.len(),
-                chunk.len(),
+                chunk.items.len(),
             );
             let output = self
                 .config
@@ -261,7 +299,8 @@ impl Splitter {
 
             let shared_files = vec!["users.json", "channels.json", "groups.json", "mpims.json"];
 
-            self.export_chunk(output, chunk, shared_files).await?;
+            self.export_chunk(output, chunk, shared_files, &HashMap::new())
+                .await?;
         }
 
         Ok(())
@@ -270,15 +309,16 @@ impl Splitter {
     async fn export_chunk(
         &mut self,
         path: PathBuf,
-        chunk: HashMap<String, usize>,
+        chunk: Chunk,
         shared_files: Vec<&str>,
+        additional_data: &HashMap<String, &[u8]>,
     ) -> Result<()> {
         // Create out file
         let mut out_file = File::create(path).await?;
         let mut writer = ZipFileWriter::with_tokio(&mut out_file);
         let mut downloads: Vec<Download> = Vec::new();
 
-        self.pb = ProgressBar::new(chunk.len() as u64);
+        self.pb = ProgressBar::new(chunk.items.len() as u64);
         self.pb.set_style(
               ProgressStyle::with_template(
                   "Export chunks: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
@@ -298,10 +338,16 @@ impl Splitter {
         }
 
         // Copy other files
-        for (filename, idx) in chunk.into_iter() {
+        for ci in chunk.items.into_iter() {
             self.pb.inc(1);
-            self.parse_and_copy_file(idx, filename, &mut writer, &mut downloads)
-                .await?;
+            for (filename, idx) in ci.files {
+                self.parse_and_copy_file(idx, filename, &mut writer, &mut downloads)
+                    .await?;
+            }
+        }
+
+        for (filename, data) in additional_data {
+            self.write_file(&mut writer, filename.clone(), data).await?;
         }
 
         self.pb.finish();
@@ -322,7 +368,7 @@ impl Splitter {
 
             if !downloads.is_empty() {
                 info!("Write upload files to zip archive...");
-                self.zip_downloaded_files(&mut writer, &mut downloads)
+                self.zip_downloaded_files(&mut writer, self.config.output.join("__uploads"))
                     .await?;
             }
         }
@@ -337,9 +383,8 @@ impl Splitter {
     async fn zip_downloaded_files(
         &mut self,
         writer: &mut ZipFileWriter<Compat<&mut File>>,
-        downloads: &mut Vec<Download>,
+        artefacts_dir: PathBuf,
     ) -> Result<()> {
-        let artefacts_dir = self.config.output.join("__uploads");
         info!("Read files from {:?}", artefacts_dir);
 
         let mut files_to_zip = Vec::new();
@@ -421,6 +466,19 @@ impl Splitter {
             .await;
 
         Ok(())
+    }
+
+    async fn write_file(
+        &mut self,
+        writer: &mut ZipFileWriter<Compat<&mut File>>,
+        filename: String,
+        data: &[u8],
+    ) -> Result<()> {
+        let builder = ZipEntryBuilder::new(ZipString::from(filename), Compression::Deflate);
+        writer
+            .write_entry_whole(builder, data)
+            .await
+            .map_err(Error::from)
     }
 
     // Copy file from reader to writer

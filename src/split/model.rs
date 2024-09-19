@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct Chunk {
+    pub items: Vec<ChunkItem>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct ChunkItem {
+    pub id: String,
+    pub files: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Direct {
     pub id: String,
     pub members: Vec<String>,
