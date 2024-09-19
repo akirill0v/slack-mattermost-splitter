@@ -43,6 +43,7 @@ pub struct Splitter {
 
     // HashMap with direct_channel keys, contains (filename, index_in_arch)
     direct_files_idx: HashMap<String, Vec<(String, usize)>>,
+    chunked_directs_idx: Vec<HashMap<String, usize>>,
 
     pb: ProgressBar,
 }
@@ -64,6 +65,7 @@ impl Splitter {
             // files_idx: HashMap::new(),
             grouped_files_idx: HashMap::new(),
             direct_files_idx: HashMap::new(),
+            chunked_directs_idx: Vec::new(),
         })
     }
 
@@ -72,11 +74,12 @@ impl Splitter {
         self.scan_files().await?;
         if !self.config.skip_directs {
             self.fetch_directs().await?;
-            self.export_directs().await?;
+            self.split_directs_to_chunks();
+            self.export_directs_chunks().await?;
         }
         if !self.config.skip_channels {
             self.split_files_to_chunks();
-            self.export_chunks().await?;
+            self.export_channels_chunks().await?;
         }
         Ok(())
     }
@@ -164,6 +167,24 @@ impl Splitter {
         Ok(())
     }
 
+    // Split direct files to chunks by full channels
+    fn split_directs_to_chunks(&mut self) {
+        let grouped_files: Vec<_> = self.direct_files_idx.iter().collect();
+
+        let chunk_size =
+            (grouped_files.len() as f64 / self.config.num_chunks as f64).ceil() as usize;
+
+        for chunk in grouped_files.chunks(chunk_size) {
+            let mut chunk_map = HashMap::new();
+            for (_, files) in chunk {
+                for (filename, idx) in files.iter() {
+                    chunk_map.insert(filename.to_string(), idx.to_owned());
+                }
+            }
+            self.chunked_directs_idx.push(chunk_map);
+        }
+    }
+
     // Split all files to chunks by full channels
     fn split_files_to_chunks(&mut self) {
         let grouped_files: Vec<_> = self.grouped_files_idx.iter().collect();
@@ -182,51 +203,57 @@ impl Splitter {
         }
     }
 
-    pub async fn export_directs(&mut self) -> Result<()> {
+    pub async fn export_directs_chunks(&mut self) -> Result<()> {
         let archive_name = self
             .config
             .slack_archive
             .file_name()
-            .unwrap_or(OsStr::new("output.zip"))
+            .unwrap_or(OsStr::new("directs.zip"))
             .to_str()
-            .unwrap_or("output.zip")
+            .unwrap_or("directs.zip")
             .to_string();
 
-        let output = self.config.output.join(format!("direct_{}", archive_name));
+        for (idx, chunk) in self.chunked_directs_idx.clone().into_iter().enumerate() {
+            info!(
+                "Export {} of {} directs chunk, files: {}",
+                idx + 1,
+                self.chunked_directs_idx.len(),
+                chunk.len(),
+            );
+            let output = self
+                .config
+                .output
+                .join(format!("directs_{:03}_{}", idx, archive_name));
 
-        info!("Output: {:?}", output);
+            info!("Output: {:?}", output);
 
-        let mut chunk = HashMap::new();
-        for (_, files) in self.direct_files_idx.clone().into_iter() {
-            for (filename, idx) in files.into_iter() {
-                chunk.insert(filename, idx);
-            }
+            self.export_chunk(output, chunk).await?;
         }
 
-        self.export_chunk(output, chunk).await
+        Ok(())
     }
 
-    pub async fn export_chunks(&mut self) -> Result<()> {
+    pub async fn export_channels_chunks(&mut self) -> Result<()> {
+        let archive_name = self
+            .config
+            .slack_archive
+            .file_name()
+            .unwrap_or(OsStr::new("channels.zip"))
+            .to_str()
+            .unwrap_or("channels.zip")
+            .to_string();
+
         for (idx, chunk) in self.chunked_files_idx.clone().into_iter().enumerate() {
             info!(
-                "Export {} of {} chunk, files: {}",
+                "Export {} of {} channels chunk, files: {}",
                 idx + 1,
                 self.chunked_files_idx.len(),
                 chunk.len(),
             );
-            let archive_name = self
-                .config
-                .slack_archive
-                .file_name()
-                .unwrap_or(OsStr::new("output.zip"))
-                .to_str()
-                .unwrap_or("output.zip")
-                .to_string();
-
             let output = self
                 .config
                 .output
-                .join(format!("chunk_{:03}_{}", idx, archive_name));
+                .join(format!("channels_{:03}_{}", idx, archive_name));
 
             info!("Output: {:?}", output);
 
