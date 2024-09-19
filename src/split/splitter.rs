@@ -403,7 +403,9 @@ impl Splitter {
                     post.file = None;
                 }
 
-                if !post.files.is_empty() {
+                if !post.files.is_empty()
+                    && post.files.iter().any(|f| !f.url_for_download().is_empty())
+                {
                     post.upload = true;
 
                     self.push_to_download(&post.files, downloads).await?;
